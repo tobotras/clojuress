@@ -1,0 +1,29 @@
+<?xml version='1.0'?>
+<ircbot-config>
+  <network>
+    <server>irc.atw-inter.net</server>
+    <port>6667</port>
+    <channel>#fidorus</channel>
+  </network>
+  <bot>
+    <nick>clojuress</nick>
+  </bot>
+  <files>
+    <users>/var/tmp/clojuress.db</users>
+    <urls>/var/tmp/clojuress.urls.db</urls>
+    <knowledge-base>/var/tmp/clojuress.knowledge.db</knowledge-base>
+    <log-prefix>/var/tmp/clojuress.</log-prefix>
+  </files>
+  <timeouts>
+    <!-- currency convertion rate, hours -->
+    <currency>4</currency>
+    <!-- authenticated user session, seconds -->
+    <session>300</session>
+  </timeouts>
+  <limits>
+    <saved-urls>3000</saved-urls>
+    <definitions>20</definitions>
+    <public-per-day>7</public-per-day>
+    <grep-lines>5</grep-lines>
+  </limits>
+</ircbot-config>
