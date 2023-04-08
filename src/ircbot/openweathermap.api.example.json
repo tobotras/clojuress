@@ -1,0 +1,26 @@
+{:tag :time,
+ :attrs {:from "2017-10-15T06:00:00", :to "2017-10-15T09:00:00"},
+ :content [{:tag :symbol,
+	    :attrs {:number "500", :name "light rain", :var "10d"},
+	    :content nil}
+	   {:tag :precipitation,
+	    :attrs {:unit "3h", :value "1.487", :type "rain"},
+	    :content nil}
+	   {:tag :windDirection,
+	    :attrs {:deg "234.501", :code "SW", :name "Southwest"},
+	    :content nil}
+	   {:tag :windSpeed,
+	    :attrs {:mps "2.07", :name "Light breeze"},
+	    :content nil}
+	   {:tag :temperature,
+	    :attrs {:unit "kelvin", :value "278.41", :min "277.393", :max "278.41"},
+	    :content nil}
+	   {:tag :pressure,
+	    :attrs {:unit "hPa", :value "994.16"},
+	    :content nil}
+	   {:tag :humidity,
+	    :attrs {:value "100", :unit "%"},
+	    :content nil}
+	   {:tag :clouds,
+	    :attrs {:value "overcast clouds", :all "92", :unit "%"},
+	    :content nil}]}

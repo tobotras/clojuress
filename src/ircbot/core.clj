@@ -7,15 +7,20 @@
         [clojure.contrib.logging :as log :only [error debug]]
         ircbot.utils)
   (:require [clojure.contrib.str-utils2 :as str2]
+            [clojure.data.json :as json]
+            [clj-http.client :as http-client]
+            [clj-time.core :as ctime]
+            [clj-time.format :as ftime]
             clojure.java.shell)
   (:import (java.net URL URLEncoder URLDecoder InetAddress)
-           (java.io BufferedReader InputStreamReader OutputStreamWriter StringReader PrintWriter PushbackReader ByteArrayInputStream IOException FileNotFoundException))
+           (java.io BufferedReader InputStreamReader OutputStreamWriter StringReader PrintWriter IOException FileNotFoundException))
   (:gen-class))
 
 ;;; Globals
 
-; Only :nick is subject to runtime change
-(def ^:dynamic *bot-config*
+(def ^:dynamic *current-nick* nil)
+
+(def bot-config
   { :server "irc.atw-inter.net"
    :port 6667
    :nick "clojuress"
@@ -25,27 +30,33 @@
    :kb-file "/var/tmp/clojuress.knowledge.db"
    :log-file-prefix "/var/tmp/clojuress."
    :session-expiration-time 300
+   :health-check-period 60
    :currency-expiration-time (* 3600 4)
    :max-saved-urls 3000
    :max-definitions 20
    :daily 7
    :max-grep-lines 5
-   :who-am-i (str "ClojureBot 0.1 build " "$Rev: 92 $")
+   :who-am-i (str "ClojureBot 0.1 " "$Rev: 123 $")
    })
 
 (defn get-xml-element [ xml tag & { :keys [ occurence ] :or { occurence 0 } } ]
   (first (:content 
           (get (vec (filter #(= tag (:tag %)) xml)) occurence))))
 
+(defn resolve-IP [hostname]
+  (whisper "Resolving " hostname)
+  (and hostname
+       (second (split (.toString (java.net.InetAddress/getByName hostname)) #"/"))))
+
 (defn- load-bot-config [filename]
   (try 
     (let [x (xml-seq (parse filename))
           xml-element (partial get-xml-element x)]
-      (def ^:dynamic *bot-config* 
-        (merge *bot-config*
-               {:server (xml-element :server)
+      (def ^:dynamic bot-config 
+        (merge bot-config
+               {:server (trim (xml-element :server))
                 :port (Integer. (xml-element :port))
-                :nick (xml-element :nick)
+                :nick (trim (xml-element :nick))
                 :to-join (xml-element :channel)
                 :user-db-file (xml-element :users)
                 :saved-urls-file (xml-element :urls)
@@ -60,7 +71,7 @@
       (whisper "Configured by " filename))
     (catch FileNotFoundException e
       (whisper (format "No config file found: %s, using default configuration" filename))))
-  (whisper "Bot configuration: " *bot-config*))
+  (whisper "Bot configuration: " bot-config))
 
 ;;; Persistent data
 ;; User DB
@@ -70,7 +81,7 @@
 (defn userdb-changed [_ _ old new]
   (when (not= old new)
     (whisper "Updating user DB")
-    (serialize new (:user-db-file *bot-config*))))
+    (serialize new (:user-db-file bot-config))))
 
 (add-watch user-db :key userdb-changed)
 
@@ -79,11 +90,11 @@
 
 (defn saved-urls-changed [_ _ old new]
   (let [new-urls (distinct new)]
-    (when (not= old new-urls)
+    (when-not (= old new-urls)
       (whisper "New URLs found, updating urls file")
-      (with-open [output (clojure.java.io/writer (:saved-urls-file *bot-config*))]
+      (with-open [output (clojure.java.io/writer (:saved-urls-file bot-config))]
         (binding [*out* output]
-          (pr (take (:max-saved-urls *bot-config*) new-urls)))))))
+          (pr (take (:max-saved-urls bot-config) new-urls)))))))
 
 (add-watch saved-urls :key saved-urls-changed)
 
@@ -117,7 +128,7 @@
 (defn login []
   "Login to IRC server"
   (println "PASS qq")
-  (loop [nick (:nick *bot-config*)]
+  (loop [nick (:nick bot-config)]
     (println "USER" nick "sw _ ClojureBot")
     (println "NICK" nick)
     (let [line (read-line)]
@@ -128,7 +139,7 @@
       (if-let [[_ code _] (re-matches (re-pattern (str ":[^ ]+ ([0-9][0-9][0-9]) (\\* )?" nick " :.*")) line)]
         (when (= code "433")
           (let [new-nick (str nick "_")]
-            (def ^:dynamic *bot-config* (assoc *bot-config* :nick new-nick))
+            (def ^:dynamic *current-nick* new-nick)
             (whisper "Changed nick to " new-nick)
             (println "NICK" new-nick)
             (recur new-nick)))
@@ -138,43 +149,36 @@
   (println "NOTICE" whom (apply str ":" text)))
 
 (defn shout [whom & text]
-  (loop [rest-of-line (apply str text)]
+  (loop [rest-of-line (apply str text)
+         rest-of-len (count rest-of-line)]
     (let [SEGMENT-SIZE 400
-          segment (subs rest-of-line 0 (min SEGMENT-SIZE (count rest-of-line)))]
+          segment (subs rest-of-line 0 (min SEGMENT-SIZE rest-of-len))]
       (println "PRIVMSG" whom (apply str ":" segment))
       (Thread/sleep 1000)
-      (when (> (count rest-of-line) SEGMENT-SIZE)
-        (recur (subs rest-of-line SEGMENT-SIZE))))))
-
-(defn fetch-url
-  "Return the web page as a string."
-  [address]
-  (whisper "Fetching data from " address)
-  (let [url (URL. address)]
-    (with-open [stream (. url (openStream))]
-      (let [buf (BufferedReader. (InputStreamReader. stream))]
-        (apply str (line-seq buf))))))
+      (when (> rest-of-len SEGMENT-SIZE)
+        (recur (subs rest-of-line SEGMENT-SIZE) (- rest-of-len SEGMENT-SIZE))))))
 
 (defn update-knowledge-base [term defs]
+  (whisper "update-knowledge-base. Term" term "defs" defs)
   (def ^:dynamic *knowledge-base*
     (if (empty? defs)
       (dissoc *knowledge-base* term)
       (assoc *knowledge-base* term defs)))
-  (serialize *knowledge-base* (:kb-file *bot-config*))
+  (serialize *knowledge-base* (:kb-file bot-config))
   true)
 
 (defn trim-is [text]
-  (let [t (str2/trim text)]
-    (if (begins-with? t "is")
-      (str2/trim (subs t 2))
-      t)))
+  (let [txt (str2/trim text)]
+    (if (begins-with? txt "is")
+      (str2/trim (subs txt 2))
+      txt)))
 
 (defn remember-term-definition [term_ text_]
   (let [term (trim term_)
         text (trim text_)
         known-term (*knowledge-base* term)
         new-def (conj known-term text)]
-    (when-not (or (> (count known-term) (:max-definitions *bot-config*))
+    (when-not (or (> (count known-term) (:max-definitions bot-config))
                   (in? known-term text))
       (update-knowledge-base term new-def))))
 
@@ -189,7 +193,9 @@
       (shout whom (act-encode "TIME"))
       (def ^:dynamic *request-list*
         (assoc *request-list* whom 
-               { :command (str ":" (char 1) "TIME"), :request "time request", :requestor name })))))
+               {:command (str ":" (char 1) "TIME")
+                :request "time request"
+                :requestor name })))))
 
 (defn handle-notice [name_ text]
   (whisper "handle-notice '" name_ "', '" text "'")
@@ -212,7 +218,7 @@
 (defn ask-google [whom term]
   (whisper "Googling for " term)
   (let [uc (.openConnection 
-            (URL. (format "http://www.google.com/search?q=%s&btnI=I&src=navclient" (URLEncoder/encode term))))]
+            (URL. (format "http://www.google.com/search?q=%s&btnI=I&src=navclient" (URLEncoder/encode term "UTF-8"))))]
     (whisper "configuring URL connection")
     (doto uc
       (.setRequestProperty "Referer" "http://www.google.com")
@@ -220,42 +226,116 @@
       (.setInstanceFollowRedirects false))
     (whisper "Streaming")
     (try
-      (if-let [[_ redir] (re-matches #".*302 Moved.*<A HREF=\"(.*)\">here</A>.*" 
-                                     (apply str (-> uc .getInputStream InputStreamReader. BufferedReader. line-seq)))]
-        (if (re-matches #".*google.com/sorry.*" redir)
-          (shout whom "Google hates you!")
-          (let [address (URLDecoder/decode redir)]
-            (remember-term-definition term address)
-            (shout whom term ": see " address)))
-        (shout whom "Nothing is known about " term))
+      (let [content (apply str (-> uc .getInputStream InputStreamReader. BufferedReader. line-seq))]
+        (whisper "Google response:" content)
+        (if-let [[_ redir] (re-matches #"(?s).*302 Moved.*<A HREF=\"(.*)\">here</A>.*" content)]
+          (if (re-matches #".*google.com/sorry.*" redir)
+            (shout whom "Google hates you!")
+            (do
+              (remember-term-definition term redir)
+              (shout whom term ": see " redir)))
+          (shout whom "Nothing is known about " term)))
       (catch IOException e
         (whisper "IOException: " e)))))
 
-(defn resolve-IP [hostname]
-  (whisper "Resolving " hostname)
-  (and hostname
-       (second (split (.toString (java.net.InetAddress/getByName hostname)) #"/"))))
+(defn- host-to-coords [hostname]
+  (whisper "Geolocating " hostname)
+  (let [ip-addr (resolve-IP hostname)
+        json (json/read-str (http-client/get (str "http://ipinfo.io/" ip-addr)))
+        coords (json "loc")]
+    (whisper "--> " coords)
+    coords))
 
 (defn parse-wwo-xml [url]
-  (let [xml (xml-seq (parse url))
-        query (get-xml-element xml :query)
-        observation-time (get-xml-element xml :observation_time)
-        cur-temp-C (get-xml-element xml :temp_C)
-        cur-desc (get-xml-element xml :weatherDesc)
-        today-temp-min (get-xml-element xml :tempMinC)
-        today-temp-max (get-xml-element xml :tempMaxC)
-        today-desc (get-xml-element xml :weatherDesc :occurence 1)
-        forecast-temp-min (get-xml-element xml :tempMinC :occurence 1)
-        forecast-temp-max (get-xml-element xml :tempMaxC :occurence 1)
-        forecast-desc (get-xml-element xml :weatherDesc :occurence 2)]
-    (if (and cur-temp-C cur-desc observation-time query today-temp-min today-temp-max 
-             today-desc forecast-desc forecast-temp-max forecast-temp-min)
-      (format "%s (%s GMT): %sC, %s. Today: %sC..%sC, %s. Forecast: %sC..%sC, %s."
-              query observation-time cur-temp-C (lower-case (trim cur-desc))
-              today-temp-min today-temp-max (lower-case (trim today-desc))
-              forecast-temp-min forecast-temp-max (lower-case (trim forecast-desc)))
-      nil)))
+  "Parse worldweatheronline API response"  
+  (try
+    (let [xml (xml-seq (parse url))
+          query (get-xml-element xml :query)
+          observation-time (get-xml-element xml :observation_time)
+          cur-temp-C (get-xml-element xml :temp_C)
+          cur-desc (get-xml-element xml :weatherDesc)
+          today-temp-min (get-xml-element xml :tempMinC)
+          today-temp-max (get-xml-element xml :tempMaxC)
+          today-desc (get-xml-element xml :weatherDesc :occurence 1)
+          forecast-temp-min (get-xml-element xml :tempMinC :occurence 1)
+          forecast-temp-max (get-xml-element xml :tempMaxC :occurence 1)
+          forecast-desc (get-xml-element xml :weatherDesc :occurence 2)]
+      (if (and cur-temp-C cur-desc observation-time query today-temp-min today-temp-max 
+               today-desc forecast-desc forecast-temp-max forecast-temp-min)
+        (format "%s (%s GMT): %sC, %s. Today: %sC..%sC, %s. Forecast: %sC..%sC, %s."
+                query observation-time cur-temp-C (lower-case (trim cur-desc))
+                today-temp-min today-temp-max (lower-case (trim today-desc))
+                forecast-temp-min forecast-temp-max (lower-case (trim forecast-desc)))
+        nil))
+    (catch java.io.IOException e
+      (whisper "Cannot load weather:" e))))
 
+
+;; {:tag :time,
+;;  :attrs {:from "2017-06-11T18:00:00", :to "2017-06-11T21:00:00"},
+;;  :content [
+;;            {:tag :symbol, :attrs {:number "803", :name "broken clouds", :var "04n"}, :content nil}
+;;            {:tag :precipitation, :attrs nil, :content nil}
+;;            {:tag :windDirection, :attrs {:deg "274.505", :code "W", :name "West"}, :content nil}
+;;            {:tag :windSpeed, :attrs {:mps "1.86", :name "Light breeze"}, :content nil}
+;;            {:tag :temperature, :attrs {:unit "kelvin", :value "289.847", :min "289.847", :max "289.847"}, :content nil}
+;;            {:tag :pressure, :attrs {:unit "hPa", :value "1003.49"}, :content nil}
+;;            {:tag :humidity, :attrs {:value "58", :unit "%"}, :content nil}
+;;            {:tag :clouds, :attrs {:value "broken clouds", :all "64", :unit "%"}, :content nil}]}
+
+
+(defn fetch-xml-element [x tag]
+  (first (filter #(= (:tag %) tag) (:content x))))
+
+(defn K->C [deg]
+  (let [val (Math/round (- (Double/parseDouble deg) 273.15))
+        sign (if (> val 0) "+" (if (< val 0) "-" ""))]
+  (format "%s%dC" sign val)))
+
+(defn pronounce-forecast [item]
+  (whisper "pronounce-forecast got item: " item)
+  (if-let [timestamp (:from (:attrs item))]
+    (let [temperature (fetch-xml-element item :temperature)
+          symbol (fetch-xml-element item :symbol)]
+      (format "%s, %s" (K->C (:value (:attrs temperature))) (:name (:attrs symbol))))
+    "not found"))
+
+(defn timestamp->datetime [s]
+  (ftime/parse (ftime/formatters :date-hour-minute-second) s))
+
+(defn lookup-tomorrow [items]
+  (let [now (timestamp->datetime (:from (:attrs (first items))))
+        t (ctime/plus now (ctime/days 1))
+        tomorrow-day (ctime/date-time (ctime/year t) (ctime/month t) (ctime/day t) 14 59)]
+    (loop [items items]
+      (when-let [next-item (first items)]
+        (if (ctime/after? (timestamp->datetime (:from (:attrs next-item))) tomorrow-day)
+          next-item
+          (recur (rest items)))))))
+
+(defn- parse-location [resp]
+  (->> (:content (fetch-xml-element resp :location))
+       (filter #(or (= (:tag %) :name)
+                    (= (:tag %) :country)))
+       (map :content)
+       flatten
+       (interpose ", ")
+       (apply str)))
+
+(defn parse-owm-xml [location url]
+  "Parse openweathermap API response"
+  (try
+    (whisper "Calling openweathermap")
+    (let [x (parse url)
+          forecast (fetch-xml-element x :forecast)
+          forecasts (vec (filter #(= (:tag %) :time) (:content forecast)))]
+      (format "Current weather for %s: %s, forecast for tomorrow: %s."
+              (parse-location x)
+              (pronounce-forecast (first forecasts))
+              (pronounce-forecast (lookup-tomorrow forecasts))))
+    (catch java.io.IOException e
+      (whisper "Cannot load weather:" e))))
+  
 (defn retrieve-user-server [name]
   (println "WHO" name)
   (loop [server-list '()]
@@ -278,7 +358,7 @@
 
 (defn expired-session? [{time :logged-at}]
   (whisper "expired-session? logged-at: " time)
-  (expired? time (:session-expiration-time *bot-config*)))
+  (expired? time (:session-expiration-time bot-config)))
 
 (defn find-real-user-by-AKA [aka]
   (whisper "find-real-user-by-AKA " aka)
@@ -295,67 +375,94 @@
 
 (defn display-weather [location whom name orig-location]
   (whisper "Displaying weather of " location)
-  (shout whom name ", " 
-         (if (nil? location)
-           (str
-            (if (= (first orig-location) \@)
-              (str (subs orig-location 1) " lives")
-              "you live")
-            " in the middle of nowhere")
-           (if-let [weather (parse-wwo-xml 
-                             (str "http://api.worldweatheronline.com/free/v1/weather.ashx?q=" 
-                                  (URLEncoder/encode location)
-                                  "&format=xml&num_of_days=2&key=jvvccgga6fwy2fszc8d5dj8a"))] ; This is my personal, please obtain your own
-             weather
-             (str "no weather have been found for " location)))))
+  (if (nil? location)
+    (shout whom name
+           (str ", "
+                (if (= (first orig-location) \@)
+                  (str (subs orig-location 1) " lives")
+                  "you live")
+                " in the middle of nowhere"))
+    (if-let [weather
+             ;; (parse-wwo-xml 
+             ;;  (str "http://api.worldweatheronline.com/free/v1/weather.ashx?q=" 
+             ;;       (URLEncoder/encode location)
+             ;;                     ; This is my personal key, please obtain your own
+             ;;       "&includeLocation=yes&format=xml&num_of_days=2&key=jvvccgga6fwy2fszc8d5dj8a"))
+             (parse-owm-xml location
+                                        ; This is my personal key, please obtain your own
+              (str "http://api.openweathermap.org/data/2.5/forecast?mode=xml&appid=3badf65afb944b0dd4a201fe232ce17c&q="
+                   (URLEncoder/encode location)))
+             ]
+      (doall (map #(shout whom name ", " %) (split weather #"\n")))
+      (shout whom name
+             (str ", no weather have been found for " location)))))
 
 ;;http://api.worldweatheronline.com/free/v1/weather.ashx?q=London&format=xml&num_of_days=2&key=jvvccgga6fwy2fszc8d5dj8a
 
+; This is my personal key, please obtain your own
 ;http://api.ipinfodb.com/v3/ip-city/?key=deaf0d1866bb62667d5440df1a148549cde1e949c556aace73cb260e00d71141&ip=
+
+(defn known-user? [name]
+  (not (expired-session? (lookup-user-entry name))))
+
+(defn set-user-location [name location]
+  (whisper "set-user-location: " name "@" location)
+  (if (known-user? name)
+    (let [entry (lookup-user-entry name)
+          realname (:name entry)
+          current-location (:city entry)]
+      (if (empty? location)               ;Just report
+        (shout name "You live in " (or current-location "nowhere"))
+        (do (reset! user-db (assoc-in @user-db [realname :city] location))
+            (shout name "You now live in " location))))
+    (shout name "I don't know you, authenticate first")))
+
+(defn user-location [user]
+  (let [host (retrieve-user-server user)
+                                        ;;; This is my personal key, please obtain your own!
+        loc (http-client/get (format "http://api.ipinfodb.com/v3/ip-city/?key=deaf0d1866bb62667d5440df1a148549cde1e949c556aace73cb260e00d71141&ip=%s" host))
+        [status _ _ _ country region city _] (split (:body loc) #";")]
+    (if (and (= status "OK") city region country)
+      (format "%s,%s" city country)
+      nil)))
 
 (defn report-weather [name server whom args]
   (whisper "report-weather: " name ", " server ", " whom ", " args ".")
   (let [l (stringify args)
         location (if (empty? l) nil l)
-        [_ requester-hostname] (re-matches #"[^@]*@(.*)" server)]
+        [_ requester-hostname] (re-matches #"[^@]*@(.*)" server)
+        location-by-user (fn [user]
+                           (or (:city (lookup-user-entry user))
+                               (user-location user)))]                           
     (whisper "Location supplied: '" location "'")
     (display-weather 
-     (if (= (first location) \@)
-       (let [user-name (subs (first args) 1)]
-         (if-let [known-city (:city (lookup-user-entry user-name))]
-           known-city
-           (if-let [user-hostname (retrieve-user-server user-name)]
-             (resolve-IP user-hostname)
-             nil)))
-       (or location (:city (lookup-user-entry name)) (resolve-IP requester-hostname)))
-     whom name location)))
+     (if (nil? location)
+       (location-by-user name)
+       (if (= (first location) \@)
+         (location-by-user (subs location 1))
+         location))
+     whom name l)))
 
 (defn authenticate-user [name password]
   (whisper "Authenticating " name)
   (= password (get-in @user-db [(lower-case name) :password])))
 
-(defn remember-user [name args]
-  (let [[realname password]
-        (if (= (count args) 1)
-          [(if-let [by-aka (find-real-user-by-AKA name)]
-             (first by-aka)
-             name)
-           (first args)]
-          [(first args) (second args)])]
-    (whisper "real user to remember: " realname)
-    (if (authenticate-user realname password)
-      (do (reset! user-db 
-                  (assoc @user-db realname
-                         (assoc (lookup-user-entry realname)
-                           :name realname :AKA name :logged-at (now) :last-seen (now))))
-          (shout name "Authenticated as " realname ", I'll remember you!"))
-      (shout name "You do not exist, go away!"))))
+(defn remember-user 
+  ([name password] 
+     (remember-user name (or (first (find-real-user-by-AKA name)) name) password))
+  ([name realname password]
+     (whisper "real user to remember: " realname)
+     (shout name
+            (if (authenticate-user realname password)
+              (do (reset! user-db 
+                          (assoc @user-db realname
+                                 (assoc (lookup-user-entry realname)
+                                   :name realname :AKA name :logged-at (now) :last-seen (now))))
+                  (str "Authenticated as " realname ", I'll remember you!"))
+              "You do not exist, go away!"))))
 
 (defn real-name [name]
   (or (first (find-real-user-by-AKA name)) name))
-
-(defn known-user? [name]
-  (not (expired-session? (lookup-user-entry name))))
 
 (defn admin? [name]
   (let [realname (real-name name)]
@@ -372,7 +479,11 @@
          (let [parsed-text (str2/split text #"[ \t\n]+")
                chan-name (first parsed-text)]
            (if (contains? *channels* chan-name)
-             (->> parsed-text rest (interpose " ") (apply str) (say-or-act-to-channel chan-name name))
+             (->> parsed-text
+                  rest
+                  (interpose " ")
+                  (apply str)
+                  (say-or-act-to-channel chan-name name))
              (shout name "Multiple channels joined, please specify the channel"))))))
   ([chan-name name text]
      (if (contains? *channels* chan-name)
@@ -415,7 +526,7 @@
                 1
                 (inc (:count entry)))]
     (whisper count " channel commands for " server)
-    (if (> count (:daily *bot-config*))
+    (if (> count (:daily bot-config))
       (do
         (def ^:dynamic *user-commands*
           (assoc *user-commands* server {:last (now), :count count}))
@@ -432,7 +543,7 @@
 (defn account-and-do [name server command whom & args]
   (if (too-many-actions? server)
     (shout name
-           "You're over public command daily limit of " (:daily *bot-config*) " commands, sorry. "
+           "You're over public command daily limit of " (:daily bot-config) " commands, sorry. "
            "I'd happily continue to chat with you in private!")
     (apply command whom args)))
 
@@ -447,35 +558,40 @@
            "No channels joined"
            (str "Channel list: " (apply str (interpose ", " (keys *channels*)))))))
 
-(defn raw-lookup-currency [from to]
-  (let [json (fetch-url
-              (format "http://www.google.com/ig/calculator?hl=en&q=1%s=?%s" from to))
-        [_ lhs _ rhs _ err] (split json #"\"")        ; Google returns invalid JSON, so parse it like this
-        [_ from-name] (re-matches #"[^ ]+ (.*)" lhs)
-        [_ the-rate to-name] (re-matches #"([^ ]+) (.*)" rhs)]
-    (whisper "json: " json ", lhs: " lhs ", rhs: " rhs ", from: " from-name ", rate: " the-rate ", to: " to-name)
-    (if (or (empty? err) (= err "0"))
-      {:from from-name
-       :to to-name
-       :rate (Double. the-rate)}
+; currency lookup
+
+(defn fetch-currency-rates []
+  ; This is my personal key, please obtain your own!
+  (let [resp (http-client/get "https://openexchangerates.org/latest.json?app_id=3bf92ea593ce47a29b9745face8c1355") ]
+    (whisper "response from openexchangerates:" resp)
+    ((json/read-str (:body resp)) "rates")))
+
+(def fetch-currency-rates-cached (memo-ttl fetch-currency-rates (:currency-expiration-time bot-config)))
+
+(defn lookup-currency [rates from to]
+  (try
+    (let [from-rate (rates (str2/upper-case from))
+          to-rate (rates (str2/upper-case to))]
+      (whisper (format "lookup-currency got rates: %s for %s, %s for %s" from-rate from to-rate to))
+      (/ to-rate from-rate))
+    (catch Exception e
+      (whisper "Rate(s) not found")
       nil)))
-
-(def lookup-currency (memo-ttl raw-lookup-currency (:currency-expiration-time *bot-config*)))
-
+  
 (defn do-convert-currency [amount f t]
   (whisper "do-convert-currency: " amount " " f " -> " t)
-  (let [abbrevs {"$" "USD", "R" "RUR", "r" "RUR", "р" "RUR", "руб" "RUR", "€" "EUR", "£" "UKP", "¥" "JPY"}
+  (let [abbrevs {"$" "USD", "rur" "RUB", "RUR" "RUB", "r" "RUB", "р" "RUB", "руб" "RUB", "€" "EUR", "£" "GBP", "¥" "JPY"}
         from (or (abbrevs f) f)
         to (or (abbrevs t) t)]
-    (if-let [entry (lookup-currency from to)]
-      (format "%s %s = %f %s" amount (:from entry) 
-              (/ (round (* amount (:rate entry) 10000)) 10000.0)
-              (:to entry))
-      (format "I don't know how to convert single %s to %s%s"
-              from to
-              (if (= amount 1.0)
-                ""
-                (str ", let alone " amount " of them"))))))
+    (let [currency-rates (fetch-currency-rates-cached)]
+      ;;      (whisper "currency-rates:" currency-rates)
+      (if-let [rate (lookup-currency currency-rates from to)]
+        (format "%s %s = %.4f %s" amount from (* amount rate) to)
+        (format "I don't know how to convert single %s to %s%s"
+                from to
+                (if (= amount 1.0)
+                  ""
+                  (str ", let alone " amount " of them")))))))
 
 (defn convert-currency [ name args ]
   (whisper "convert-currency: " name ", " args)
@@ -494,17 +610,6 @@
   (shout name (str 
                "Known commands: auth, change-pass, grep, location, seen, ucc, urls, learn, forget, fact, whats, stat, time, units, where, wr, wtf."
                (if (admin? name) " Admin-only commands: stop, join, leave, say, act, add-user, kill-user, eval, channels." ""))))
-
-(defn set-user-location [name location]
-  (if (known-user? name)
-    (let [entry (lookup-user-entry name)
-          realname (:name entry)
-          current-location (:city entry)]
-      (if (empty? location)               ;Just report
-        (shout name "You live in " (or current-location "nowhere"))
-        (do (reset! user-db (assoc-in @user-db [realname :city] location))
-            (shout name "You now live in " location))))
-    (shout name "I don't know you, authenticate first")))
 
 (defn join-channel [name channel]
   (when channel
@@ -655,7 +760,7 @@
 (defn ctcp-version [name]         
   (whisper "Replying with VERSION")
   (notice name 
-          (ctcpify "VERSION" (str (:who-am-i *bot-config*)
+          (ctcpify "VERSION" (str (:who-am-i bot-config)
                                   (System/getProperty "os.name") "/" (System/getProperty "os.arch") 
                                   "/" "JRE " (System/getProperty "java.runtime.version")))))
 
@@ -683,15 +788,10 @@
     (let [user (real-name (trim user_))]
       (if-let [city (get-in @user-db [user :city])]
         (shout name user " lives in " city)
-        (let [host (retrieve-user-server user)
-              MY-IPINFODB-KEY "deaf0d1866bb62667d5440df1a148549cde1e949c556aace73cb260e00d71141"
-              loc (fetch-url (format "http://api.ipinfodb.com/v3/ip-city/?key=%s&ip=%s" 
-                                     MY-IPINFODB-KEY host))
-              [status _ _ _ country region city _] (split loc #";")]
-          (if (and (= status "OK") city region country)
-            (do (shout name "I've learned that " user " lives in " city ", " region ", " country)
-                (reset! user-db (assoc-in @user-db [user :city] city)))
-            (shout name user " lives in the middle of nowhere")))))))
+        (if-let [location (user-location user)]
+          (do (shout name "I've learned that " user " lives in " location)
+              (reset! user-db (assoc-in @user-db [user :city] location)))
+          (shout name user " lives in the middle of nowhere"))))))
 
 (defn convert-units [name & args ]
   (let [from (ffirst args)
@@ -706,15 +806,20 @@
         (shout name (trim resp))))))
 
 (defn channel-log-file [channel]
-  (str (:log-file-prefix *bot-config*) channel ".log"))
+  (str (:log-file-prefix bot-config) channel ".log"))
 
 (defn censor-grep-output [line]
-  (whisper "censor: " line)
   (or
    (re-matches (re-pattern #".*PRIVMSG .*") line)
-   (re-matches #"<.*!.*@.*> \.(.*)" line) ; leading dot: public bot command, most probably
+   (re-matches #".* <.*!.*@.*> \.(.*)" line) ; leading dot: public bot command, most probably
    (re-matches #".*(pidar|пидар).*" line) ; #fidorus specific :)
-   (re-matches (re-pattern (str "<.*!.*@.*> " (:nick *bot-config*) ".*")) line))) ; my own actions
+   (re-matches (re-pattern (str "<.*!.*@.*> " *current-nick* ".*")) line))) ; my own actions
+
+                                        ; 2020-01-25 22:19 <damned!~damned@213.141.138.199> qwe
+(defn compactify-userid [line]
+  (if-let [[_ timestamp userid rest] (re-matches #"(.*) <(.*)!.*> (.*)" line)]
+    (str timestamp " <" userid "> " rest)
+    line))
 
 (defn grep-log [name text_]
   (if (empty? text_)
@@ -731,14 +836,12 @@
           (let [lines (->> (:out (clojure.java.shell/sh "grep" "-i" "-e" to-grep log-file))
                            (#(split % #"\n"))
                            (remove censor-grep-output)
-                           (reverse)
-                           (take (:max-grep-lines *bot-config*)))]
-            (doseq [l lines]
-              (whisper "line: " l))
+			   (reverse)
+                           (take (:max-grep-lines bot-config)))]
             (if (empty? lines)
               (shout name "No match for '" to-grep "'")
               (doseq [l lines]
-                (shout name l)))))
+                (shout name (compactify-userid l))))))
         (shout name "No such channel (did I join any channel yet?)")))))
 
 (defn do-action [name server action]
@@ -749,9 +852,9 @@
       "grep" (grep-log name arg-string)
       "wr" (report-weather name server name args)
       "ucc" (convert-currency name args)
-      "auth" (remember-user name args)
+      "auth" (apply remember-user name args)
       "stop" (admin-only name shutdown-bot)
-      "location" (set-user-location name (first args))
+      "location" (set-user-location name arg-string)
       "join" (admin-only name join-channel (first args))
       "leave" (admin-only name leave-channel (first args))
       "say" (admin-only name say-to-channel arg-string)
@@ -803,7 +906,7 @@
       nil)))
 
 (defn chat-statistics [name text]
-  (let [new-sentences (count (split text #"[\.:\?!]"))
+  (let [new-sentences (count (remove #(empty? %) (clojure.string/split text #"[\.:\?!]")))
         user (real-name name)
         entry (lookup-user-entry user)]
     (whisper "Adding " new-sentences " sents for " user)
@@ -820,8 +923,8 @@
   (when-let [action
              (if (= (first message) \.)
                (subs message 1)
-               (if (begins-with? message (:nick *bot-config*))
-                 (triml-regex "[-,: ]*" (subs message (count (:nick *bot-config*))))
+               (if (begins-with? message *current-nick*)
+                 (triml-regex "[-,: ]*" (subs message (count *current-nick*)))
                  nil))]
     (do-chan-action channel name server action)))
 
@@ -833,6 +936,9 @@
 
 (defn update-last-seen [name]
   (reset! user-db (assoc-in @user-db [name :last-seen] (now))))
+
+(def got-pong (atom true))
+(def start-status (atom "Startup"))
 
 (defn process-command [line]
   (whisper "< " line)
@@ -847,14 +953,19 @@
           (case command
             "PRIVMSG"  (let [message (triml-whitespace (subs (triml-whitespace args) 1))]
                          (grab-URLs message)
-                         ((if (= addressee (:nick *bot-config*))
+                         ((if (= addressee *current-nick*)
                             privmsg-reply
                             channel-reply) addressee name server message))
 ;;;         "JOIN" (handle-user-join name)
 ;;;         "PART" (handle-user-leave name)
-            "NOTICE" (if (= addressee (:nick *bot-config*))
+            "NOTICE" (if (= addressee *current-nick*)
                        (handle-notice name args))
-            nil))))
+            nil)))
+      (case command
+        "PONG" (do
+                 (reset! got-pong true)
+                 (whisper "PONG <"))
+        nil))
     (let [[_ command args] (re-matches #"([^ ]+) :(.*)" line)]
       (whisper "Command: " command ", args: " args)
       (case command
@@ -863,15 +974,44 @@
                  (whisper "Ponged " args))
         nil))))
 
+
+(def health-checker (atom nil))
+(def reconnect? (atom false))
+
+(defn start-health-checker []
+  (reset! health-checker
+          (future
+            (Thread/sleep 10000)
+            (while true
+              (whisper "got-pong is " @got-pong)
+              (when
+                  (and
+                   (= @got-pong false)
+                   (= @start-status "Working"))
+                (whisper "Network failure detected!")
+                (reset! got-pong true)
+                (reset! reconnect? true))
+              (println "PING" (trim (:server bot-config)))
+              (whisper "PING >")
+              (reset! got-pong false)
+              (Thread/sleep 5000)))))
+
 (defn maintain []
   "Main loop"
-  (when-let [line (read-line)]
-    (process-command line)
-    (maintain)))
-
+  (start-health-checker)
+  (loop [line (read-line)]
+    (when @reconnect?
+      (whisper "Breaking from maintain: network failure")
+      (reset! reconnect? false)
+      (future-cancel @health-checker)
+      (throw (Exception. "Ping timeout")))
+    (when (not (nil? line))
+      (process-command line)
+      (recur (read-line)))))
+ 
 (defn startup-hook [ message ]
   (whisper "Running startup hook")
-  (join-channel "Tobotras" (:to-join *bot-config*))
+  (join-channel "Tobotras" (:to-join bot-config))
   (when message
     (shout "Tobotras" message)))
 
@@ -881,33 +1021,37 @@
   (whisper "Loading config")
   (load-bot-config "ircbot.xml")
   (whisper "Loading user DB")
-  (load-userdb (:user-db-file *bot-config*))
+  (load-userdb (:user-db-file bot-config))
   (whisper "Loading knowledge DB")
-  (load-knowledge-base (:kb-file *bot-config*))
+  (load-knowledge-base (:kb-file bot-config))
   (whisper "Loading saved URLs")
-  (load-saved-urls (:saved-urls-file *bot-config*)))
-
+  (load-saved-urls (:saved-urls-file bot-config))
+  (System/setProperty "javax.net.ssl.trustStore" "jssecacerts")
+  (def *current-nick* (:nick bot-config))
+  (reset! start-status "Startup"))
+ 
 (defn -main []
   (initialize-bot)
-  (let [start-status (atom "Startup")]
-    (while true
-      (whisper "Connecting to " (:server *bot-config*))
-      (try
-        (if-let [conn (socket (:server *bot-config*) (:port *bot-config*))]
-          (binding [*in* (:in conn)
-                    *out* (:out conn)]
-            (whisper "Logging to server")
-            (login)
-            (whisper "We're in the network!")
-            (startup-hook @start-status)
-            (whisper "Working")
-            (maintain))
-          (error (str "Cannot connect to " (:server *bot-config*) ":" (:port *bot-config*))))
-        (catch java.net.ConnectException e
-          (whisper "ConnectException: " e)
-          (swap! start-status (fn [old new] new) e))
-        (catch java.lang.Exception e
-          (whisper "Base exception: " e)
-          (swap! start-status (fn [old new] new) e)))
-      (error "Restarting connection")
-      (Thread/sleep 5000))))
+  (while true
+    (whisper "Connecting to " (:server bot-config))
+    (try
+      (if-let [conn (socket (trim (:server bot-config)) (:port bot-config))]
+        (binding [*in* (:in conn)
+                  *out* (:out conn)]
+          (whisper "Logging to server")
+          (login)
+          (whisper "We're in the network!")
+          (startup-hook @start-status)
+          (whisper "Working")
+          (reset! start-status "Working")
+          (maintain))
+        (error (str "Cannot connect to " (:server bot-config) ":" (:port bot-config))))
+      (catch java.net.ConnectException e
+        (whisper "ConnectException: " e)
+        (reset! start-status e))
+      (catch java.lang.Exception e
+        (whisper "Base exception: " e)
+        (reset! start-status e)))
+    (error "Restarting connection")
+    (reset! start-status "Startup")
+    (Thread/sleep 30000)))

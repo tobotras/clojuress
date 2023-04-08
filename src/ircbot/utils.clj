@@ -3,7 +3,8 @@
   (:import (java.net URL URLEncoder InetAddress)
            (java.lang StringBuilder)
            (java.io BufferedReader InputStreamReader StringReader PushbackReader ByteArrayInputStream))
-  (:require [clojure.contrib.str-utils2 :as str2])
+  (:require [clojure.contrib.str-utils2 :as str2]
+            [clojure.java.io :as io])
   (:gen-class))
 
 (defn whisper [ & args ]
@@ -49,9 +50,14 @@
 (defmethod print-dup java.util.Date [o w]
   (print-ctor o (fn [o w] (print-dup (.getTime  o) w)) w))
 
+(defn copy-file [source-path dest-path]
+  (io/copy (io/file source-path) (io/file dest-path)))
+
 (defn serialize
   "Print a data structure to a file so that we may read it in later."
   [data-structure #^String filename]
+  (when (> (.length (io/file filename)) 0)
+    (copy-file filename (str filename "~")))
   (binding [*print-dup* true] 
     (spit filename (pr-str data-structure))))
  
