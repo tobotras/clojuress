@@ -389,11 +389,11 @@
              ;;                     ; This is my personal key, please obtain your own
              ;;       "&includeLocation=yes&format=xml&num_of_days=2&key=jvvccgga6fwy2fszc8d5dj8a"))
              (parse-owm-xml location
-                                        ; This is my personal key, please obtain your own
-              (str "http://api.openweathermap.org/data/2.5/forecast?mode=xml&appid=3badf65afb944b0dd4a201fe232ce17c&q="
-                   (URLEncoder/encode location)))
-             ]
-      (doall (map #(shout whom name ", " %) (split weather #"\n")))
+                            ;; This is my personal key, please obtain your own
+                            (str "http://api.openweathermap.org/data/2.5/forecast?mode=xml&appid=3badf65afb944b0dd4a201fe232ce17c&q="
+                                 (URLEncoder/encode location)))]
+      (doseq [line (split weather #"\n")]
+        (shout whom name ", " line))
       (shout whom name
              (str ", no weather have been found for " location)))))
 
@@ -773,14 +773,12 @@
 
 (defn process-ctcp [name message]
   (whisper "process-ctcp (probably): '" message "' from " name)
-  (if-let [action (first 
-                   (filter 
-                    #(begins-with? message (act-encode %)) 
-                    (keys ctcp-actions)))]
-    (do (whisper "Calling CTCP handler for " action)
-        ((ctcp-actions action) name)
-        true)
-    false))
+  (when-let [action (first 
+                     (filter 
+                      #(begins-with? message (act-encode %)) 
+                      (keys ctcp-actions)))]
+    (whisper "Calling CTCP handler for " action)
+    ((ctcp-actions action) name)))
 
 (defn where-is [name user_]
   (if (empty? user_)
